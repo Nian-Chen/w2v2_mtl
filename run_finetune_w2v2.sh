@@ -1,0 +1,36 @@
+#!/bin/bash
+time CUDA_VISIBLE_DEVICES=1 python -m torch.distributed.launch  \
+--nproc_per_node 1 finetune_w2v2.py  \
+--output_dir=training_output  \
+--report_to=tensorboard  \
+--logging_dir=tensorboard/ws_train_s  \
+--num_train_epochs=15  \
+--logging_strategy=steps  \
+--logging_steps=10  \
+--logging_first_step  \
+--per_device_train_batch_size=4  \
+--per_device_eval_batch_size=1  \
+--gradient_accumulation_steps=16  \
+--save_total_limit=5  \
+--evaluation_strategy=steps  \
+--eval_steps=2000  \
+--save_strategy=steps  \
+--save_steps=2000  \
+--learning_rate=2e-4  \
+--lr_scheduler_type=czc  \
+--warmup_ratio=0.1  \
+--group_by_length  \
+--fp16=True  \
+--encoder_decoder_mode=True \
+--encoder_or_w2v2model_path=encoder  \
+--decoder_path=decoder  \
+--dataset_dir=hf_datasets \
+--processor_path=processor \
+--preprocessing_num_workers=8  \
+--dataloader_num_workers=8  \
+--freeze_feature_extractor=True  \
+--freeze_ALN=False  \
+--freeze_all_except_lm=False  \
+--speed_perturb=True  \
+--prediction_loss_only=False  \
+--verbose_log=False
