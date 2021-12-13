@@ -1661,8 +1661,11 @@ def main():
         # encoder.load_state_dict(state_dict,strict=False)
         # model = encoder
     processor = Wav2Vec2Processor.from_pretrained(model_args.processor_path)
-    vocab_size = model.decoder.config.vocab_size if model_args.encoder_decoder_mode == True else model.config.vocab_size
-    assert processor.tokenizer.vocab_size == vocab_size,f"vocab_size of model is {model.config.vocab_size}, but vocab_size of model is {processor.tokenizer.vocab_size}"
+    if model_args.encoder_decoder_mode == True:
+        assert model.encoder.config.vocab_size == model.decoder.config.vocab_size == processor.tokenizer.vocab_size, \
+            f"vocab_size of encoder is {model.encoder.config.vocab_size}, vocab_size of decoder is {model.decoder.config.vocab_size}, vocab_size of tokenizer is {processor.tokenizer.vocab_size}"
+    else:
+        assert model.config.vocab_size == processor.tokenizer.vocab_size,f"vocab_size of model is {model.config.vocab_size}, but vocab_size of tokenizer is {processor.tokenizer.vocab_size}"
 
     if model_args.reinit_lm_head:
         nn.init.normal_(model.lm_head.weight)
