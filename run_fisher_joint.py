@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-import scipy.io as sio
+import torchaudio
+import torch.nn.functional as F
 from CzcWav2vec2 import Wav2vec2_Gpt2
-from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig, Wav2Vec2Model, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig, Wav2Vec2Model
+from transformers import BertConfig, EncoderDecoderConfig, EncoderDecoderModel, GPT2Config, BertGenerationConfig
+from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput, CausalLMOutput, MaskedLMOutput
 import time
 import copy
 from tqdm import tqdm
+from itertools import groupby
 from typing import Optional, Tuple
 import math
 import glob
@@ -13,6 +17,8 @@ import collections
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset, IterableDataset
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data.sampler import RandomSampler, SequentialSampler
+from transformers.modeling_utils import PreTrainedModel
 from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_callback import (
@@ -96,6 +102,8 @@ import inspect
 from packaging import version
 from torch import nn
 
+import librosa
+from lang_trans import arabic
 from transformers import (
     HfArgumentParser,
     Trainer,
@@ -106,16 +114,15 @@ from transformers import (
     Wav2Vec2Processor,
     is_apex_available,
     trainer_utils,
+    AutoConfig
 )
 from datasets import load_dataset, load_from_disk
 import os
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-os.environ["HF_HOME"] = "huggingface-home"
-os.environ["TRANSFORMERS_CACHE"] = "huggingface-home/transformers"
-os.environ["HF_MODELS_CACHE"] = "huggingface-home/datasets"
-os.environ["HF_METRICS_CACHE"] = "huggingface-home/metrics"
-os.environ["HF_DATASETS_CACHE"] = "huggingface-home/datasets"
+os.environ["HF_DATASETS_CACHE"] = "/data2_from_58175/huggingface-tmp"
+os.environ["TMPDIR"] = "/data2_from_58175/huggingface-tmp"
+
 if is_apex_available():
     from apex import amp
 
@@ -154,23 +161,23 @@ class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
     """
-    encoder_or_w2v2model_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"},
+
+    model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
-    decoder_path: Optional[str] = field(
+    cache_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "path to decoder in encoder_decoder_mode"},
-    )
-    processor_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "path to processor, containing vocab.json"},
+        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
     )
     freeze_feature_extractor: Optional[bool] = field(
         default=True, metadata={"help": "Whether to freeze the feature extractor layers of the model."}
     )
     freeze_all_except_lm: Optional[bool] = field(
         default=False, metadata={"help": "Whether to freeze all parameters of the model except lm_head."}
+    )
+
+    gradient_checkpointing: Optional[bool] = field(
+        default=False, metadata={"help": "Whether to freeze the feature extractor layers of the model."}
     )
     verbose_logging: Optional[bool] = field(
         default=False,
@@ -179,6 +186,9 @@ class ModelArguments:
     freeze_ALN: Optional[bool] = field(
         default=False,
         metadata={"help": "Whether to freeze freeze parameters of freeze_feature_extractor and feed_forward."}
+    )
+    use_gpt_tokenizer: Optional[bool] = field(
+        default=False, metadata={"help": "Whether to use_gpt_tokenizer,vocab size=50261."}
     )
     reinit_lm_head: Optional[bool] = field(
         default=False, metadata={"help": "Whether to reinitial lm_head"}
@@ -189,28 +199,11 @@ class ModelArguments:
     freeze_decoder: Optional[bool] = field(
         default=False, metadata={"help": "Whether to freeze freeze parameters of decoder when in encoder_decoder_mode"}
     )
-
-
-@dataclass
-class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-
-    Using `HfArgumentParser` we can turn this class
-    into argparse arguments to be able to specify them on
-    the command line.
-    """
-    dataset_dir: str = field(
-        metadata={"help": "Path to hf_datasets, including train and dev"}
-    )
-    preprocessing_num_workers: Optional[int] = field(
-        default=None,
-        metadata={"help": "The number of processes to use for the preprocessing."},
-    )
-    speed_perturb: Optional[bool] = field(
+    remove_silence: Optional[bool] = field(
         default=False,
-        metadata={"help": "apply speed perpturbation in collator."},
+        metadata={"help": "Whether to exclude samples with empty transcription,usually in the end of training"}
     )
+
 
 def configure_logger(model_args: ModelArguments, training_args: TrainingArguments):
     logging.basicConfig(
@@ -225,6 +218,152 @@ def configure_logger(model_args: ModelArguments, training_args: TrainingArgument
         logging_level = logging.INFO
     logger.setLevel(logging_level)
 
+
+@dataclass
+class DataTrainingArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+
+    Using `HfArgumentParser` we can turn this class
+    into argparse arguments to be able to specify them on
+    the command line.
+    """
+
+    dataset_name: str = field(
+        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    dataset_config_name: Optional[str] = field(
+        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    train_split_name: Optional[str] = field(
+        default="train",
+        metadata={
+            "help": "The name of the training data set split to use (via the datasets library). Defaults to 'train'"
+        },
+    )
+    validation_split_name: Optional[str] = field(
+        default="validation",
+        metadata={
+            "help": "The name of the validation data set split to use (via the datasets library). Defaults to 'validation'"
+        },
+    )
+    target_text_column: Optional[str] = field(
+        default="text",
+        metadata={"help": "Column in the dataset that contains label (target text). Defaults to 'text'"},
+    )
+    speech_file_column: Optional[str] = field(
+        default="file",
+        metadata={"help": "Column in the dataset that contains speech file path. Defaults to 'file'"},
+    )
+    target_feature_extractor_sampling_rate: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Resample loaded audio to target feature extractor's sampling rate or not."},
+    )
+    max_duration_in_seconds: Optional[float] = field(
+        default=None,
+        metadata={"help": "Filters out examples longer than specified. Defaults to no filtering."},
+    )
+    orthography: Optional[str] = field(
+        default="librispeech",
+        metadata={
+            "help": "Orthography used for normalization and tokenization: 'librispeech' (default), 'timit', or 'buckwalter'."
+        },
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
+    )
+    preprocessing_num_workers: Optional[int] = field(
+        default=None,
+        metadata={"help": "The number of processes to use for the preprocessing."},
+    )
+    speed_perturb: Optional[bool] = field(
+        default=False,
+        metadata={"help": "apply speed perpturbation in collator."},
+    )
+
+
+@dataclass
+class Orthography:
+    """
+    Orthography scheme used for text normalization and tokenization.
+
+    Args:
+        do_lower_case (:obj:`bool`, `optional`, defaults to :obj:`False`):
+            Whether or not to accept lowercase input and lowercase the output when decoding.
+        vocab_file (:obj:`str`, `optional`):
+            File containing the vocabulary.
+        word_delimiter_token (:obj:`str`, `optional`, defaults to :obj:`"|"`):
+            The token used for delimiting words; it needs to be in the vocabulary.
+        translation_table (:obj:`Dict[str, str]`, `optional`, defaults to :obj:`{}`):
+            Table to use with `str.translate()` when preprocessing text (e.g., "-" -> " ").
+        words_to_remove (:obj:`Set[str]`, `optional`, defaults to :obj:`set()`):
+            Words to remove when preprocessing text (e.g., "sil").
+        untransliterator (:obj:`Callable[[str], str]`, `optional`):
+            Function that untransliterates text back into native writing system.
+    """
+
+    do_lower_case: bool = False
+    vocab_file: Optional[str] = None
+    word_delimiter_token: Optional[str] = "|"
+    translation_table: Optional[Dict[str, str]] = field(default_factory=dict)
+    words_to_remove: Optional[Set[str]] = field(default_factory=set)
+    untransliterator: Optional[Callable[[str], str]] = None
+
+    @classmethod
+    def from_name(cls, name: str):
+        if name == "librispeech":
+            return cls()
+        if name == "timit":
+            return cls(
+                do_lower_case=True,
+                # break compounds like "quarter-century-old" and replace pauses "--"
+                translation_table=str.maketrans({"-": " "}),
+            )
+        if name == "buckwalter":
+            translation_table = {
+                "-": " ",  # sometimes used to represent pauses
+                "^": "v",  # fixing "tha" in arabic_speech_corpus dataset
+            }
+            return cls(
+                vocab_file=pathlib.Path(__file__).parent.joinpath("vocab/buckwalter.json"),
+                word_delimiter_token="/",  # "|" is Arabic letter alef with madda above
+                translation_table=str.maketrans(translation_table),
+                words_to_remove={"sil"},  # fixing "sil" in arabic_speech_corpus dataset
+                untransliterator=arabic.buckwalter.untransliterate,
+            )
+        raise ValueError(f"Unsupported orthography: '{name}'.")
+
+    def preprocess_for_training(self, text: str) -> str:
+        # TODO(elgeish) return a pipeline (e.g., from jiwer) instead? Or rely on branch predictor as is
+        if len(self.translation_table) > 0:
+            text = text.translate(self.translation_table)
+        if len(self.words_to_remove) == 0:
+            text = " ".join(text.split())  # clean up whitespaces
+        else:
+            text = " ".join(w for w in text.split() if w not in self.words_to_remove)  # and clean up whilespaces
+        return text
+
+    def create_processor(self, model_args: ModelArguments) -> Wav2Vec2Processor:
+        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+            model_args.model_name_or_path, cache_dir=model_args.cache_dir
+        )
+        if self.vocab_file:
+            tokenizer = Wav2Vec2CTCTokenizer(
+                self.vocab_file,
+                cache_dir=model_args.cache_dir,
+                do_lower_case=self.do_lower_case,
+                word_delimiter_token=self.word_delimiter_token,
+            )
+        else:
+            tokenizer = Wav2Vec2CTCTokenizer.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=model_args.cache_dir,
+                do_lower_case=self.do_lower_case,
+                word_delimiter_token=self.word_delimiter_token,
+            )
+        return Wav2Vec2Processor(feature_extractor, tokenizer)
+
+
 class Add_Noise_Reverb(object):
 
     def __init__(self, musan_path, rir_path):
@@ -234,7 +373,7 @@ class Add_Noise_Reverb(object):
         self.noisesnr = {'noise': [40, 50], 'speech': [40, 50], 'music': [40, 50]}
         # 三种类型噪声的采样数目，用于叠加多段，speech使用4-7段(模拟多人背景噪声)，noise或者music只使用一段
         self.numnoise = {'noise': [1, 1], 'speech': [3, 7], 'music': [1, 1]}
-        # noiselist的keys为 'noise'、'speech'、'music' 
+        # noiselist的keys为 'noise'、'speech'、'music'
         # values是对应的文件列表
         self.noiselist = {}
         # musan_path="/tsdata/sre/musan"
@@ -249,7 +388,7 @@ class Add_Noise_Reverb(object):
         # pointsource_noises有843条
         # 总共有61260条混响样本
         self.simulated_rirs_files = glob.glob(os.path.join(rir_path, '*/*/*/*.wav'))
-        # 
+        #
         self.real_point_rirs_files = glob.glob(os.path.join(rir_path, '*/*.wav'))
         #         self.rir_files = glob.glob(os.path.join("/tsdata/noise/RIRS_NOISES/real_rirs_isotropic_noises/",'*.wav'))
         self.rir_files = self.simulated_rirs_files + self.real_point_rirs_files
@@ -395,7 +534,7 @@ class DataCollatorCTCWithPadding:
             # print(features)
             label_features = [{"input_ids": self.processor.tokenizer(feature["text"]).input_ids} for feature in
                               features]
-        # print(label_features)
+        print(label_features)
         with self.processor.as_target_processor():
             labels_batch = self.processor.pad(
                 label_features,
@@ -414,55 +553,6 @@ class DataCollatorCTCWithPadding:
         # print(batch["labels"][:,-5:])
         return batch
 
-@dataclass
-class DataCollatorCTCWithPadding_JH:
-    """
-    Data collator that will dynamically pad the inputs received.
-    Args:
-        processor (:class:`~transformers.Wav2Vec2Processor`)
-            The processor used for proccessing the data.
-        padding (:obj:`bool`, :obj:`str` or :class:`~transformers.tokenization_utils_base.PaddingStrategy`, `optional`, defaults to :obj:`True`):
-            Select a strategy to pad the returned sequences (according to the model's padding side and padding index)
-            among:
-            * :obj:`True` or :obj:`'longest'`: Pad to the longest sequence in the batch (or no padding if only a single
-              sequence if provided).
-            * :obj:`'max_length'`: Pad to a maximum length specified with the argument :obj:`max_length` or to the
-              maximum acceptable input length for the model if that argument is not provided.
-            * :obj:`False` or :obj:`'do_not_pad'` (default): No padding (i.e., can output a batch with sequences of
-              different lengths).
-        max_length (:obj:`int`, `optional`):
-            Maximum length of the ``input_values`` of the returned list and optionally padding length (see above).
-        max_length_labels (:obj:`int`, `optional`):
-            Maximum length of the ``labels`` returned list and optionally padding length (see above).
-        pad_to_multiple_of (:obj:`int`, `optional`):
-            If set will pad the sequence to a multiple of the provided value.
-            This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
-            7.5 (Volta).
-    """
-
-    processor: Wav2Vec2Processor
-    padding: Union[bool, str] = True
-    max_length: Optional[int] = None
-    max_length_labels: Optional[int] = None
-    pad_to_multiple_of: Optional[int] = None
-    pad_to_multiple_of_labels: Optional[int] = None
-
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        batch = {}
-        input_features = []
-        if "file" in features[0].keys() and "id" in features[0].keys():
-            for feature in features:
-                seq = sio.loadmat(feature["file"])[int(feature["id"])-1]
-                input_features.append({"input_values": seq})
-        else:
-            raise ValueError(f" ['file'] is required for collect func")
-
-        if "labels" in features[0].keys():
-            batch["labels"] = torch.tensor(features["labels"],dtype=torch.long)
-            # print(batch["input_values"].dtype)
-        else:
-            raise ValueError(f" ['labels'] is required for collect func")
-        return batch
 
 @dataclass
 class DataCollatorCTCWithPadding_Speed_Perturb:
@@ -614,10 +704,6 @@ class DataCollatorCTCWithPadding_Speed_Perturb:
         return batch
 
 
-# 做变速需要设置input_column_change，全局变量的设置依赖于data_args.speed_perturb，所以将参数获取从main中抽取出来
-# parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
-# model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-# input_column_change = True if data_args.speed_perturb else False
 class CTCTrainer(Trainer):
     def __init__(
             self,
@@ -636,7 +722,7 @@ class CTCTrainer(Trainer):
             data_collator_eval: Optional[DataCollator] = None,
             pseudo_onthefly: Optional[bool] = None,
             teacher_model: Union[PreTrainedModel, nn.Module] = None,
-            eval_only_encoder: Optional[bool] = None,
+            encoder_decoder_mode: Optional[bool] = None,
     ):
         super(CTCTrainer, self, ).__init__(
             model,
@@ -655,7 +741,7 @@ class CTCTrainer(Trainer):
         self.pseudo_onthefly = pseudo_onthefly
         self.data_collator_eval = data_collator_eval
         self.teacher_model = teacher_model
-        self.eval_only_encoder = eval_only_encoder
+        self.encoder_decoder_mode = encoder_decoder_mode
 
     def _remove_unused_columns(self, dataset: "datasets.Dataset", description: Optional[str] = None):
         global input_column_change
@@ -674,8 +760,6 @@ class CTCTrainer(Trainer):
         ignored_columns.remove("speech") if "speech" in ignored_columns else None
         ignored_columns.remove("file") if "file" in ignored_columns else None
         ignored_columns.remove("text") if "text" in ignored_columns else None
-        # ignored_columns.remove("seg_end") if "seg_end" in ignored_columns else None
-        # ignored_columns.remove("seg_start") if "seg_start" in ignored_columns else None
 
         # if input_column_change:
         # ignored_columns.remove("speech")
@@ -845,7 +929,7 @@ class CTCTrainer(Trainer):
                 observed_num_examples += observed_batch_size
 
             # Prediction step
-            if self.eval_only_encoder:
+            if self.encoder_decoder_mode:
                 loss, logits, labels = self.prediction_step(model.encoder, inputs, prediction_loss_only,
                                                             ignore_keys=ignore_keys)
             else:
@@ -1201,7 +1285,7 @@ class CTCTrainer(Trainer):
         self._total_ctc_loss_scalar = 0.0
         self._total_additional_loss_scalar = 0.0
 
-        # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses        
+        # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
         model.zero_grad()
@@ -1248,7 +1332,7 @@ class CTCTrainer(Trainer):
                 # print(inputs["labels"][:,-5:])
                 #                 set_trace()
                 #####################################
-                # if self.state.global_step <= 11940 and self.state.global_step>=4:      
+                # if self.state.global_step <= 11940 and self.state.global_step>=4:
                 # print(f"self.state.global_step = {self.state.global_step}")
                 # print(f"self.state.epoch = {self.state.epoch}")
                 # self.state.global_step += 1
@@ -1305,7 +1389,7 @@ class CTCTrainer(Trainer):
                     # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
                     #########################################################
                     with model.no_sync():
-                        if not self.eval_only_encoder:
+                        if not self.encoder_decoder_mode:
                             # set_trace()
                             tr_loss_ = self.training_step(model, inputs, teacher_model=self.teacher_model)
                             tr_loss += tr_loss_
@@ -1321,7 +1405,7 @@ class CTCTrainer(Trainer):
                 else:
                     #                     print(self.teacher_model)
                     #########################################################
-                    if not self.eval_only_encoder:
+                    if not self.encoder_decoder_mode:
                         # set_trace()
                         tr_loss_ = self.training_step(model, inputs, teacher_model=self.teacher_model)
                         tr_loss += tr_loss_
@@ -1480,9 +1564,10 @@ class CTCTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def compute_kl_loss(self, p, q):
-        q_loss = F.kl_div(q.log_softmax(dim=-1), p.softmax(dim=-1), reduction='sum')
+        # q_loss = F.kl_div(q.log_softmax(dim=-1), p.softmax(dim=-1), reduction='sum')
         p_loss = F.kl_div(p.log_softmax(dim=-1), q.softmax(dim=-1), reduction='sum')
-        return (q_loss + p_loss) / 2
+        # return (q_loss+p_loss)/2
+        return p_loss
 
     def compute_distill_loss(self, model, teacher_model, inputs, return_outputs=False):
         """
@@ -1498,7 +1583,7 @@ class CTCTrainer(Trainer):
         logits = outputs["logits"]
         with torch.no_grad():
             teacher_model.eval()
-            teacher_outputs_logits = model.to(logits.device)(**inputs)["logits"]
+            teacher_outputs_logits = teacher_model.to(logits.device)(**inputs)["logits"]
         #         log_probs_mat = logits
         # print(f"log_probs_mat.shape={log_probs_mat.shape}")
         #         log_probs_mat_mask = log_probs_mat.argmax(dim=-1,keepdim=True)
@@ -1506,7 +1591,7 @@ class CTCTrainer(Trainer):
         # print(f"log_probs_mat_onehot.shape={log_probs_mat_onehot.shape}")
         # print(f"log_probs_mat_mask.shape={log_probs_mat_mask.shape}")
         distill_loss = self.compute_kl_loss(logits, teacher_outputs_logits)
-        # kl_loss = self.compute_kl_loss(log_probs_mat,log_probs_mat_onehot)/num_char_tokens           
+        # kl_loss = self.compute_kl_loss(log_probs_mat,log_probs_mat_onehot)/num_char_tokens
         #         distill_weight = 0.001
 
         # Save past state if it exist
@@ -1550,7 +1635,7 @@ class CTCTrainer(Trainer):
         inputs = self._prepare_inputs(inputs)
         # print(inputs["input_values"][0,-5:])
         # print(inputs["attention_mask"][0,-5:])
-        # print(inputs["labels"][0,-5:])          
+        # print(inputs["labels"][0,-5:])
 
         # if flag:
         # torch.save(inputs, "./input_values_.pt")
@@ -1559,7 +1644,7 @@ class CTCTrainer(Trainer):
             with autocast():
                 #########################################################
                 if not teacher_model:
-                    if self.eval_only_encoder:
+                    if self.encoder_decoder_mode:
                         # training_step DDP 各卡算各自的，每批都会进行loss的反向传播并计算梯度
                         ctc_loss, att_loss = self.compute_loss(model, inputs)
                         # print(ctc_loss,"\n",att_loss)
@@ -1569,6 +1654,10 @@ class CTCTrainer(Trainer):
                         loss = self.compute_loss(model, inputs)
                 else:
                     ctc_loss, distill_loss = self.compute_distill_loss(model, teacher_model, inputs)
+                    # print(f"ctc_loss={ctc_loss}")
+                    # print(f"distill_loss={distill_loss}")
+                    loss = ctc_loss + 0.5 * distill_loss
+                    # loss = 0.5 * distill_loss
             # print(f"loss with autocast={loss}")
         else:
             loss = self.compute_loss(model, inputs)
@@ -1586,7 +1675,7 @@ class CTCTrainer(Trainer):
             # print("####################model is wrapped####################")
             # print(f"####################type(model):{type(model)}####################")
             #########################################################
-            if self.eval_only_encoder:
+            if self.encoder_decoder_mode:
                 if model.module.encoder.config.ctc_loss_reduction == "mean":
                     ctc_loss = ctc_loss.mean()
                 elif model.module.encoder.config.ctc_loss_reduction == "sum":
@@ -1621,8 +1710,8 @@ class CTCTrainer(Trainer):
                     raise ValueError(f"{model.config.ctc_loss_reduction} is not valid. Choose one of ['mean', 'sum']")
         else:
             # print("####################model is not wrapped####################")
-            # print(f"####################type(model):{type(model)}####################")        
-            if self.eval_only_encoder:
+            # print(f"####################type(model):{type(model)}####################")
+            if self.encoder_decoder_mode:
                 if model.encoder.config.ctc_loss_reduction == "mean":
                     ctc_loss = ctc_loss.mean()
                 elif model.encoder.config.ctc_loss_reduction == "sum":
@@ -1646,15 +1735,14 @@ class CTCTrainer(Trainer):
 
         if self.args.gradient_accumulation_steps > 1:
             loss = loss / self.args.gradient_accumulation_steps
-            if self.eval_only_encoder:
+            if self.encoder_decoder_mode:
                 ctc_loss = ctc_weight * ctc_loss / self.args.gradient_accumulation_steps
                 att_loss = (1 - ctc_weight) * att_loss / self.args.gradient_accumulation_steps
                 loss_tuple = (ctc_loss, att_loss)
-        else:
-            if self.eval_only_encoder:
-                ctc_loss = ctc_weight * ctc_loss / self.args.gradient_accumulation_steps
-                att_loss = (1 - ctc_weight) * att_loss / self.args.gradient_accumulation_steps
-                loss_tuple = (ctc_loss, att_loss)
+        elif self.encoder_decoder_mode:
+            ctc_loss = ctc_weight * ctc_loss / self.args.gradient_accumulation_steps
+            att_loss = (1 - ctc_weight) * att_loss / self.args.gradient_accumulation_steps
+            loss_tuple = (ctc_loss, att_loss)
         if self.use_amp:
             self.scaler.scale(loss).backward()
         elif self.use_apex:
@@ -1664,7 +1752,7 @@ class CTCTrainer(Trainer):
             self.deepspeed.backward(loss)
         else:
             loss.backward()
-        if self.eval_only_encoder:
+        if self.encoder_decoder_mode:
             return loss.detach(), loss_tuple
 
         return loss.detach()
@@ -1675,6 +1763,13 @@ def show_args(args):
 
 
 def main():
+    # See all possible arguments in src/transformers/training_args.py
+    # or by passing the --help flag to this script.
+    # We now keep distinct sets of args, for a cleaner separation of concerns.
+
+    # parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+
+    # model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
@@ -1684,62 +1779,99 @@ def main():
     logger.info(f"{stars}data_args:{stars}\n{data_args}")
     logger.info(f"{stars}training_args:{stars}\n{training_args}")
 
+    orthography = Orthography.from_name(data_args.orthography.lower())
 
+    # processor = orthography.create_processor(model_args)
+    # model = Wav2Vec2ForCTC.from_pretrained(
+    # model_args.model_name_or_path,
+    # cache_dir="/data2_from_58175/huggingface/models",
+    # gradient_checkpointing=model_args.gradient_checkpointing,
+    # vocab_size=32,
+    # )
     if model_args.encoder_decoder_mode:
-
-        encoder = Wav2Vec2ForCTC.from_pretrained(model_args.encoder_or_w2v2model_path)
-        # encoder_config = AutoConfig.from_pretrained(model_args.encoder_or_w2v2model_path)
-        # encoder = Wav2Vec2ForCTC(encoder_config)
-        # model = Wav2Vec2ForCTC.from_pretrained(model_args.model_name_or_path)
-        # state_dict = torch.load("/data2_from_58175/huggingface/models/wav2vec-large-xlsr-53-init-wenetspeech-vocabs/pytorch_model.bin",map_location="cpu")
-        # encoder.load_state_dict(state_dict,strict=False)
-
-        decoder = AutoModelForCausalLM.from_pretrained(model_args.decoder_path)
+        encoder_model_path = "/data2_from_58175/huggingface/models/wav2vec2_gpt2/encoder"
+        decoder_model_path = "/data2_from_58175/huggingface/models/wav2vec2_gpt2/decoder"
+        encoder = Wav2Vec2ForCTC.from_pretrained(encoder_model_path)
+        decoder = AutoModelForCausalLM.from_pretrained(decoder_model_path)
         model = Wav2vec2_Gpt2(encoder=encoder, decoder=decoder)
-        # state_dict = torch.load("/data2_from_58175/wav2vec2_output/fisher_joint/checkpoint-25000/pytorch_model.bin",map_location="cpu")
+        # state_dict = torch.load(
+        #     "/data2_from_58175/wav2vec2_output/fisher_joint//pytorch_model.bin",
+        #     map_location="cpu")
         # model.load_state_dict(state_dict)
         logger.info(f"{stars}use Wav2vec2_Gpt2 model{stars} ")
 
     else:
-        model = Wav2Vec2ForCTC.from_pretrained(model_args.encoder_or_w2v2model_path)
-        # state_dict = torch.load("/data2_from_58175/wav2vec2_output/fisher_joint/-checkpoint-118000/pytorch_model.bin",map_location="cpu")
-        # model.load_state_dict(state_dict)
-
-        # encoder_config = AutoConfig.from_pretrained("/data2_from_58175/huggingface/models/wav2vec-large-xlsr-53-init-wenetspeech-vocabs/config_small.json")
-        # encoder = Wav2Vec2ForCTC(encoder_config)
-        # state_dict = torch.load("/data2_from_58175/huggingface/models/wav2vec-large-xlsr-53-init-wenetspeech-vocabs/pytorch_model.bin",map_location="cpu")
-        # encoder.load_state_dict(state_dict,strict=False)
-        # model = encoder
-    processor = Wav2Vec2Processor.from_pretrained(model_args.processor_path)
-    if model_args.encoder_decoder_mode == True:
-        assert model.encoder.config.vocab_size == model.decoder.config.vocab_size == processor.tokenizer.vocab_size, \
-            f"vocab_size of encoder is {model.encoder.config.vocab_size}, vocab_size of decoder is {model.decoder.config.vocab_size}, vocab_size of tokenizer is {processor.tokenizer.vocab_size}"
-    else:
-        assert model.config.vocab_size == processor.tokenizer.vocab_size,f"vocab_size of model is {model.config.vocab_size}, but vocab_size of tokenizer is {processor.tokenizer.vocab_size}"
-
+        # encoder_config = AutoConfig.from_pretrained(
+        #     "/data2_from_58175/huggingface/models/wav2vec-large-xlsr-53-init-minanyu-vocabs/config_small.json")
+        # model = Wav2Vec2ForCTC(encoder_config)
+        model = Wav2Vec2ForCTC.from_pretrained(model_args.model_name_or_path)
+        # state_dict = torch.load(
+        #     "/data2_from_58175/huggingface/models//pytorch_model.bin",
+        #     map_location="cpu")
+        # model.load_state_dict(state_dict, strict=False)
+        # teacher_model = Wav2Vec2ForCTC.from_pretrained("/data2_from_58175/wav2vec2_output/fisher_joint/purectc-checkpoint-39000-40.19-44.78")
     if model_args.reinit_lm_head:
         nn.init.normal_(model.lm_head.weight)
         logger.info(f"{stars}reinitial lm_head{stars}")
+    processor = Wav2Vec2Processor.from_pretrained("/data2_from_58175/huggingface/models/wav2vec2-large-960h-lv60-self")
+    # if not model_args.use_gpt_tokenizer:
+    #     processor = Wav2Vec2Processor.from_pretrained("/data2_from_58175/huggingface/models/processor-minnanyu")
+    # else:
+    #     processor = Wav2Vec2Processor_Gpt_Tokenizer.from_pretrained(
+    #         pretrained_model_name_or_path="/data2_from_58175/huggingface/models/wav2vec2-large-960h-lv60-self",
+    #         gpt_tokenizer_name_or_path="/data2_from_58175/huggingface/models/tiny-gpt2-tokenizer",
+    #     )
+    #     logger.info(f"{stars}use_gpt_tokenizer,vocab_size={processor.tokenizer.vocab_size}{stars}")
+    #     model.lm_head = nn.Linear(1024, 50257)
+    #     model.lm_head.weight = torch.load("/data2_from_58175/huggingface/models/gpt2-medium/gpt2_lm_head_weight.bin")
+    #     with torch.no_grad():
+    #         # gpt的special token的embedding在model.lm_head.weight的最后一行
+    #         # ctc的pad token(special token)被改为了0.所以将两行进行调换
+    #         # inplace的操作不能计算梯度，所以要with torch.no_grad()
+    #         special_token_embedding = copy.deepcopy(model.lm_head.weight[-1])
+    #         model.lm_head.weight[-1] = model.lm_head.weight[0]
+    #         model.lm_head.weight[0] = special_token_embedding
+    #     print(f"!!!!!!!!!!!!get weight of model.lm_head={model.lm_head} from pretrained gpt2!!!!!!!!!!!! ")
 
-    wer_metric = datasets.load_metric("./wer")
+    # pseudo_model = Wav2Vec2ForCTC.from_pretrained(
+    #     model_args.model_name_or_path,
+    #     cache_dir="/data2_from_58175/huggingface/models",
+    #     gradient_checkpointing=model_args.gradient_checkpointing,
+    #     vocab_size=len(processor.tokenizer),
+    # ).cpu()
 
-    dataset_dir = data_args.dataset_dir
-    prepare_train_path = os.path.join(dataset_dir, "train")
-    prepare_dev_path = os.path.join(dataset_dir, "dev")
+    # print(model.lm_head.weight)
+    # 特征融合
+    # model = CzcWav2Vec2ForCTC.from_pretrained(
+    # model_args.model_name_or_path,
+    # cache_dir="/data2_from_58175/huggingface/models",
+    # gradient_checkpointing=model_args.gradient_checkpointing,
+    # vocab_size=len(processor.tokenizer),
+    # )
+    # train_dataset = datasets.load_dataset(
+    # data_args.dataset_name, data_args.dataset_config_name, split=data_args.train_split_name
+    # )
+    # val_dataset = datasets.load_dataset(
+    # data_args.dataset_name, data_args.dataset_config_name, split=data_args.validation_split_name
+    # )
+
+    wer_metric = datasets.load_metric("/data2_from_58175/huggingface/metrics/wer")
+    dataset_path = "/data2_from_58175/fisher_swbd_nodup_script"
+    prepare_train_path = os.path.join(dataset_path, 'train')
+    prepare_dev_path = os.path.join(dataset_path, 'dev')
 
     logger.info(time.strftime('%Y-%m-%d %H:%M:%S'))
     logger.info(f"{stars}loading train_dataset{stars}")
     train_dataset = load_from_disk(prepare_train_path)
-    ignored_columns = list(set(train_dataset.column_names) - set(["file", "labels", "length", "text"]))
+    ignored_columns = list(set(train_dataset.column_names) - set(["file", "length", "text"]))
     train_dataset = train_dataset.remove_columns(ignored_columns)
 
     logger.info(time.strftime('%Y-%m-%d %H:%M:%S'))
-    logger.info(f"{stars}loading val_dataset{stars}")
+
 
     val_dataset = load_from_disk(prepare_dev_path)
-    val_dataset = val_dataset.remove_columns(ignored_columns).select(range(200))
-    print(train_dataset[0]["file"])
-    print(val_dataset[0]["file"])
+    val_dataset = val_dataset.remove_columns(ignored_columns).select(range(500))
+
     train_total_dur = sum(train_dataset["length"]) / 3600
     train_maxlength = sorted(train_dataset["length"], reverse=True)[0]
 
@@ -1754,12 +1886,12 @@ def main():
     logger.info(f"total duration of val_dataset:\n{val_total_dur} hours\n")
     logger.info(f"maxlength of val_dataset:\n{val_maxlength} s\n")
 
-    # 变速在data_collator中实现，默认使用torchaudio，但由于一些原因，需要把speech值作为输入，而input_values值可以忽略，input_column_change在_remove_unused_columns作用
     logger.info(f"{stars}do speech perpturbation{stars}") if data_args.speed_perturb else None
 
-    data_collator = DataCollatorCTCWithPadding_JH(processor=processor, padding=True)
+    data_collator = DataCollatorCTCWithPadding_Speed_Perturb(processor=processor,padding=True) if data_args.speed_perturb \
+        else DataCollatorCTCWithPadding(processor=processor, padding=True)
     # 验证集不进行在线增强
-    data_collator_eval = DataCollatorCTCWithPadding_JH(processor=processor, padding=True)
+    data_collator_eval = DataCollatorCTCWithPadding(processor=processor, padding=True)
 
     def compute_metrics(pred):
         pred_logits = pred.predictions
@@ -1773,10 +1905,13 @@ def main():
         # RUNNING ->RUNING
         label_str = processor.batch_decode(pred.label_ids, group_tokens=False)
         if logger.isEnabledFor(logging.INFO):
-            # 选十句打印结果
-            for reference, predicted in zip(label_str[:10], pred_str[:10]):
+            for reference, predicted in zip(label_str[50:60], pred_str[50:60]):
                 logger.info(f'reference: "{reference}"')
                 logger.info(f'predicted: "{predicted}"')
+        #             if orthography.untransliterator is not None:
+        #                 logger.debug(f'reference (untransliterated): "{orthography.untransliterator(reference)}"')
+        #                 logger.debug(f'predicted (untransliterated): "{orthography.untransliterator(predicted)}"')
+
         wer = wer_metric.compute(predictions=pred_str, references=label_str)
 
         return {"wer": wer}
@@ -1812,7 +1947,7 @@ def main():
         pseudo_model=None,
         pseudo_onthefly=False,
         teacher_model=None,
-        eval_only_encoder=model_args.encoder_decoder_mode,
+        encoder_decoder_mode=model_args.encoder_decoder_mode,
     )
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 

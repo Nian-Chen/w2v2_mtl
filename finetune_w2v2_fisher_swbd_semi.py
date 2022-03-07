@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import scipy.io as sio
 from CzcWav2vec2 import Wav2vec2_Gpt2
 from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig, Wav2Vec2Model, AutoConfig
 import time
@@ -111,11 +110,10 @@ from datasets import load_dataset, load_from_disk
 import os
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-os.environ["HF_HOME"] = "huggingface-home"
-os.environ["TRANSFORMERS_CACHE"] = "huggingface-home/transformers"
-os.environ["HF_MODELS_CACHE"] = "huggingface-home/datasets"
-os.environ["HF_METRICS_CACHE"] = "huggingface-home/metrics"
-os.environ["HF_DATASETS_CACHE"] = "huggingface-home/datasets"
+os.environ["TRANSFORMERS_CACHE"] = "/data2_from_58175/huggingface/transformers"
+os.environ["HF_DATASETS_CACHE"] = "/data2_from_58175/huggingface/datasets"
+os.environ["HF_METRICS_CACHE"] = "/data2_from_58175/huggingface/metrics"
+os.environ["HF_HOME"] = "/data2_from_58175/huggingface"
 if is_apex_available():
     from apex import amp
 
@@ -210,6 +208,14 @@ class DataTrainingArguments:
     speed_perturb: Optional[bool] = field(
         default=False,
         metadata={"help": "apply speed perpturbation in collator."},
+    )
+    pl_data_dir: str = field(
+        default=None,
+        metadata={"help": "Path to pseudo-labeled hf_datasets"}
+    )
+    id_json: str = field(
+        default=None,
+        metadata={"help": "id of pseudo-labeled hf_datasets to be selected"}
     )
 
 def configure_logger(model_args: ModelArguments, training_args: TrainingArguments):
@@ -414,55 +420,6 @@ class DataCollatorCTCWithPadding:
         # print(batch["labels"][:,-5:])
         return batch
 
-@dataclass
-class DataCollatorCTCWithPadding_JH:
-    """
-    Data collator that will dynamically pad the inputs received.
-    Args:
-        processor (:class:`~transformers.Wav2Vec2Processor`)
-            The processor used for proccessing the data.
-        padding (:obj:`bool`, :obj:`str` or :class:`~transformers.tokenization_utils_base.PaddingStrategy`, `optional`, defaults to :obj:`True`):
-            Select a strategy to pad the returned sequences (according to the model's padding side and padding index)
-            among:
-            * :obj:`True` or :obj:`'longest'`: Pad to the longest sequence in the batch (or no padding if only a single
-              sequence if provided).
-            * :obj:`'max_length'`: Pad to a maximum length specified with the argument :obj:`max_length` or to the
-              maximum acceptable input length for the model if that argument is not provided.
-            * :obj:`False` or :obj:`'do_not_pad'` (default): No padding (i.e., can output a batch with sequences of
-              different lengths).
-        max_length (:obj:`int`, `optional`):
-            Maximum length of the ``input_values`` of the returned list and optionally padding length (see above).
-        max_length_labels (:obj:`int`, `optional`):
-            Maximum length of the ``labels`` returned list and optionally padding length (see above).
-        pad_to_multiple_of (:obj:`int`, `optional`):
-            If set will pad the sequence to a multiple of the provided value.
-            This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
-            7.5 (Volta).
-    """
-
-    processor: Wav2Vec2Processor
-    padding: Union[bool, str] = True
-    max_length: Optional[int] = None
-    max_length_labels: Optional[int] = None
-    pad_to_multiple_of: Optional[int] = None
-    pad_to_multiple_of_labels: Optional[int] = None
-
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        batch = {}
-        input_features = []
-        if "file" in features[0].keys() and "id" in features[0].keys():
-            for feature in features:
-                seq = sio.loadmat(feature["file"])[int(feature["id"])-1]
-                input_features.append({"input_values": seq})
-        else:
-            raise ValueError(f" ['file'] is required for collect func")
-
-        if "labels" in features[0].keys():
-            batch["labels"] = torch.tensor(features["labels"],dtype=torch.long)
-            # print(batch["input_values"].dtype)
-        else:
-            raise ValueError(f" ['labels'] is required for collect func")
-        return batch
 
 @dataclass
 class DataCollatorCTCWithPadding_Speed_Perturb:
@@ -1735,9 +1692,18 @@ def main():
 
     logger.info(time.strftime('%Y-%m-%d %H:%M:%S'))
     logger.info(f"{stars}loading val_dataset{stars}")
-
     val_dataset = load_from_disk(prepare_dev_path)
     val_dataset = val_dataset.remove_columns(ignored_columns).select(range(200))
+
+    logger.info(time.strftime('%Y-%m-%d %H:%M:%S'))
+    logger.info(f"{stars}loading pseudo_dataset{stars}")
+    pl_dataset = load_from_disk(data_args.pl_data_dir)
+    id_json = data_args.id_json
+    with open(id_json, "r", encoding="utf-8") as f:
+        load_id = json.load(f)["id"]
+    pl_dataset = pl_dataset.select(load_id).rename_column("transcription","text")
+    pl_dataset = pl_dataset.remove_columns(ignored_columns)
+
     print(train_dataset[0]["file"])
     print(val_dataset[0]["file"])
     train_total_dur = sum(train_dataset["length"]) / 3600
@@ -1746,7 +1712,10 @@ def main():
     val_total_dur = sum(val_dataset["length"]) / 3600
     val_maxlength = sorted(val_dataset["length"], reverse=True)[0]
 
-    logger.info(f"total_train_dataset:\n{train_dataset}\n")
+    pl_total_dur = sum(pl_dataset["length"]) / 3600
+    pl_maxlength = sorted(pl_dataset["length"], reverse=True)[0]
+
+    logger.info(f"train_dataset:\n{train_dataset}\n")
     logger.info(f"total duration of train_dataset:\n{train_total_dur} hours\n")
     logger.info(f"maxlength of train_dataset:\n{train_maxlength} s\n")
 
@@ -1754,12 +1723,22 @@ def main():
     logger.info(f"total duration of val_dataset:\n{val_total_dur} hours\n")
     logger.info(f"maxlength of val_dataset:\n{val_maxlength} s\n")
 
+    logger.info(f"pl_dataset:\n{pl_dataset}\n")
+    logger.info(f"total duration of pl_dataset:\n{pl_total_dur} hours\n")
+    logger.info(f"maxlength of pl_dataset:\n{pl_maxlength} s\n")
+    train_dataset = datasets.concatenate_datasets([train_dataset, pl_dataset])
+
+    logger.info(f"total_train_dataset:\n{train_dataset}\n")
+    logger.info(f"total duration of total_train_dataset:\n{train_total_dur} hours\n")
+    logger.info(f"maxlength of total_train_dataset:\n{train_maxlength} s\n")
+
     # 变速在data_collator中实现，默认使用torchaudio，但由于一些原因，需要把speech值作为输入，而input_values值可以忽略，input_column_change在_remove_unused_columns作用
     logger.info(f"{stars}do speech perpturbation{stars}") if data_args.speed_perturb else None
 
-    data_collator = DataCollatorCTCWithPadding_JH(processor=processor, padding=True)
+    data_collator = DataCollatorCTCWithPadding_Speed_Perturb(processor=processor,padding=True) if data_args.speed_perturb else \
+        DataCollatorCTCWithPadding(processor=processor, padding=True)
     # 验证集不进行在线增强
-    data_collator_eval = DataCollatorCTCWithPadding_JH(processor=processor, padding=True)
+    data_collator_eval = DataCollatorCTCWithPadding(processor=processor, padding=True)
 
     def compute_metrics(pred):
         pred_logits = pred.predictions
