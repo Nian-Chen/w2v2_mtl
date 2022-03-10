@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
+from CzcWav2vec2 import (
+    get_czc_scheduler,
+    get_w2v2_scheduler,
+)
+from transformers.optimization import get_scheduler
 import scipy.io as sio
-from CzcWav2vec2 import Wav2vec2_Gpt2
+from CzcWav2vec2 import Wav2vec2_Gpt2, GPT2_Decoder
 from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig, Wav2Vec2Model, AutoConfig
 import time
 import copy
@@ -77,7 +82,6 @@ from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from torch.utils.data.dataloader import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from transformers.modeling_utils import PreTrainedModel
-from transformers.models.wav2vec2.modeling_wav2vec2 import CzcWav2Vec2Model, CzcWav2Vec2ForCTC
 from speechbrain.processing.speech_augmentation import SpeedPerturb
 import logging
 import pathlib
@@ -106,9 +110,10 @@ from transformers import (
     Wav2Vec2Processor,
     is_apex_available,
     trainer_utils,
+    is_wandb_available,
 )
 from datasets import load_dataset, load_from_disk
-import os
+import os,wandb
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ["HF_HOME"] = "huggingface-home"
@@ -189,7 +194,14 @@ class ModelArguments:
     freeze_decoder: Optional[bool] = field(
         default=False, metadata={"help": "Whether to freeze freeze parameters of decoder when in encoder_decoder_mode"}
     )
-
+    use_czc_lr_scheduler: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to use czc_lr_scheduler or not."},
+    )
+    use_w2v2_lr_scheduler: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to use w2v2_lr_scheduler or not."},
+    )
 
 @dataclass
 class DataTrainingArguments:
@@ -372,7 +384,7 @@ class DataCollatorCTCWithPadding:
                 # feature_normalized = (waveform - torch.mean(waveform)) / torch.sqrt(torch.var(waveform) + 1e-5)
                 # input_features.append({"input_values": feature_normalized})
                 # 法二
-                waveform = sox_effects.apply_effects_file(path=feature["file"], effects=[['rate', str(16000)]])[0]
+                waveform = sox_effects.apply_effects_file(path=feature["file"].replace("/tsdata/","/data/tsdata/"), effects=[['rate', str(16000)]])[0]
                 waveform = waveform[0]
                 feature_normalized = (waveform - torch.mean(waveform)) / torch.sqrt(torch.var(waveform) + 1e-5)
                 input_features.append({"input_values": feature_normalized})
@@ -494,13 +506,14 @@ class DataCollatorCTCWithPadding_Speed_Perturb:
         # different padding methods
 
         # print([feature["labels"][:1] for feature in features])
-        speed = random.choices(self.speeds, self.sp_weights, k=1)[0]
+        # speed = random.choices(self.speeds, self.sp_weights, k=1)[0]
         # sr = 16000
         # volumn = random.choices(self.volumns, self.vol_weights, k=1)[0]
         # pitch = random.choices(self.pitchs, self.pit_weights, k=1)[0]
         input_features = []
         if "speech" in features[0].keys():
             for feature in features:
+                speed = random.choices(self.speeds, self.sp_weights, k=1)[0]
                 if speed != 1.0:
                     # torchaudio需要二维数组(1,*)，输出也是二维数组，所以再调用时后输出后需要unsqueeze(0)和squeeze(0)
                     feature_speed_perturbed = sox_effects.apply_effects_tensor(
@@ -535,6 +548,7 @@ class DataCollatorCTCWithPadding_Speed_Perturb:
         elif "file" in features[0].keys():
             # 无法直接使用apply_effects_file，因为还需要根据seg_start和seg_end对segments音频进行裁出
             for feature in features:
+                speed = random.choices(self.speeds, self.sp_weights, k=1)[0]
                 # torchaudio需要二维数组(1,*)，输出也是二维数组，所以再调用时后输出后需要unsqueeze(0)和squeeze(0)
                 # logger.info("load opus")
                 # 法一：根据file seg_start seg_end切出样本，在进行在线扩增降采样，但有的oups太大，速度很麻
@@ -550,12 +564,11 @@ class DataCollatorCTCWithPadding_Speed_Perturb:
                 # waveform, sr,[['speed', str(speed)], ['rate', str(16000)]])[0]
                 # 法二：事先离线将样本切割出并存储，此使batch["file"]以更新为样本对应得flac文件
                 if speed != 1.0:
-                    feature_speed_perturbed = sox_effects.apply_effects_file(path=feature["file"],
+                    feature_speed_perturbed = sox_effects.apply_effects_file(path=feature["file"].replace("/tsdata/","/data/tsdata/"),
                                                                              effects=[['speed', str(speed)],
                                                                                       ['rate', str(16000)]])[0]
                 else:
-                    feature_speed_perturbed = \
-                    sox_effects.apply_effects_file(path=feature["file"], effects=[['rate', str(16000)]])[0]
+                    feature_speed_perturbed = sox_effects.apply_effects_file(path=feature["file"].replace("/tsdata/","/data/tsdata/"), effects=[['rate', str(16000)]])[0]
                 if self.add_no_re and speed == 1.0:
                     # 1-4则加混响或者加噪
                     augtype = random.choices([2, 3, 4], [1, 1, 1], k=1)[0]
@@ -637,6 +650,8 @@ class CTCTrainer(Trainer):
             pseudo_onthefly: Optional[bool] = None,
             teacher_model: Union[PreTrainedModel, nn.Module] = None,
             eval_only_encoder: Optional[bool] = None,
+            use_czc_lr_scheduler: Optional[bool] = None,
+            use_w2v2_lr_scheduler: Optional[bool] = None,
     ):
         super(CTCTrainer, self, ).__init__(
             model,
@@ -656,7 +671,44 @@ class CTCTrainer(Trainer):
         self.data_collator_eval = data_collator_eval
         self.teacher_model = teacher_model
         self.eval_only_encoder = eval_only_encoder
+        self.use_czc_lr_scheduler = use_czc_lr_scheduler
+        self.use_w2v2_lr_scheduler = use_w2v2_lr_scheduler
+    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+        """
+        Setup the scheduler. The optimizer of the trainer must have been set up before this method is called.
 
+        Args:
+            num_training_steps (int): The number of training steps to do.
+        """
+        # print(self.optimizer)
+        if self.lr_scheduler is None:
+            warmup_steps = (
+                self.args.warmup_steps
+                if self.args.warmup_steps > 0
+                else math.ceil(num_training_steps * self.args.warmup_ratio)
+            )
+            if self.use_czc_lr_scheduler:
+                logger.info("use_czc_lr_scheduler")
+                self.lr_scheduler = get_czc_scheduler(
+                    optimizer=self.optimizer if optimizer is None else optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=num_training_steps,
+                )
+                
+            elif self.use_w2v2_lr_scheduler:
+                logger.info("use_w2v2_lr_scheduler")
+                self.lr_scheduler = get_w2v2_scheduler(
+                    optimizer=self.optimizer if optimizer is None else optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=num_training_steps,
+                )
+            else:
+                self.lr_scheduler = get_scheduler(
+                    self.args.lr_scheduler_type,
+                    optimizer=self.optimizer if optimizer is None else optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=num_training_steps,
+                )
     def _remove_unused_columns(self, dataset: "datasets.Dataset", description: Optional[str] = None):
         global input_column_change
         if not self.args.remove_unused_columns:
@@ -965,10 +1017,13 @@ class CTCTrainer(Trainer):
             self.store_flos()
 
             self.log(logs)
-
+            if self.args.local_rank in [0, -1]:
+                wandb.log(logs)
         metrics = None
         if self.control.should_evaluate:
             metrics = self.evaluate()
+            if self.args.local_rank in [0, -1]:
+                wandb.log(metrics)
             self._report_to_hp_search(trial, epoch, metrics)
 
         if self.control.should_save:
@@ -1680,9 +1735,9 @@ def main():
 
     configure_logger(model_args, training_args)
     stars = "*" * 20
-    logger.info(f"{stars}model_args:{stars}\n{model_args}")
-    logger.info(f"{stars}data_args:{stars}\n{data_args}")
-    logger.info(f"{stars}training_args:{stars}\n{training_args}")
+    # logger.info(f"{stars}model_args:{stars}\n{model_args}")
+    # logger.info(f"{stars}data_args:{stars}\n{data_args}")
+    # logger.info(f"{stars}training_args:{stars}\n{training_args}")
 
 
     if model_args.encoder_decoder_mode:
@@ -1693,8 +1748,17 @@ def main():
         # model = Wav2Vec2ForCTC.from_pretrained(model_args.model_name_or_path)
         # state_dict = torch.load("/data2_from_58175/huggingface/models/wav2vec-large-xlsr-53-init-wenetspeech-vocabs/pytorch_model.bin",map_location="cpu")
         # encoder.load_state_dict(state_dict,strict=False)
-
-        decoder = AutoModelForCausalLM.from_pretrained(model_args.decoder_path)
+        encoder.config.mask_time_prob = 0.50
+        encoder.config.mask_time_length = 10
+        encoder.config.mask_feature_prob = 0.50
+        encoder.config.mask_feature_length = 64
+        
+        config_decoder = AutoConfig.from_pretrained(model_args.decoder_path)
+        # config_decoder.vocab_size = 29
+        # decoder = AutoModelForCausalLM.from_pretrained(model_args.decoder_path)
+        # decoder = AutoModelForCausalLM.from_config(config_decoder)
+        # decoder = AutoModelForCausalLM.from_config(config_decoder)
+        decoder = GPT2_Decoder(config_decoder)
         model = Wav2vec2_Gpt2(encoder=encoder, decoder=decoder)
         # state_dict = torch.load("/data2_from_58175/wav2vec2_output/fisher_joint/checkpoint-25000/pytorch_model.bin",map_location="cpu")
         # model.load_state_dict(state_dict)
@@ -1738,8 +1802,8 @@ def main():
 
     val_dataset = load_from_disk(prepare_dev_path)
     val_dataset = val_dataset.remove_columns(ignored_columns).select(range(200))
-    print(train_dataset[0]["file"])
-    print(val_dataset[0]["file"])
+    logger.info(train_dataset[0]["file"])
+    logger.info(val_dataset[0]["file"])
     train_total_dur = sum(train_dataset["length"]) / 3600
     train_maxlength = sorted(train_dataset["length"], reverse=True)[0]
 
@@ -1757,10 +1821,17 @@ def main():
     # 变速在data_collator中实现，默认使用torchaudio，但由于一些原因，需要把speech值作为输入，而input_values值可以忽略，input_column_change在_remove_unused_columns作用
     logger.info(f"{stars}do speech perpturbation{stars}") if data_args.speed_perturb else None
 
-    data_collator = DataCollatorCTCWithPadding_JH(processor=processor, padding=True)
+    data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
     # 验证集不进行在线增强
-    data_collator_eval = DataCollatorCTCWithPadding_JH(processor=processor, padding=True)
-
+    data_collator_eval = DataCollatorCTCWithPadding(processor=processor, padding=True)
+    if is_wandb_available() and training_args.local_rank in [0, -1]:
+        # 只跟踪主进程，DDP下主进程local_rank为0，正常情况为-1
+        import wandb
+        config = {"command":sys.argv, **vars(model_args), **vars(data_args), **vars(training_args), **vars(model.config)}
+        logger.info(config)
+        wandb.init(project=training_args.logging_dir.split("/")[-1])
+        wandb.config.update(config)
+        wandb.watch(model, log="all")
     def compute_metrics(pred):
         pred_logits = pred.predictions
         pred_ids = np.argmax(pred_logits, axis=-1)

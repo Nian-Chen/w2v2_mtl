@@ -33,4 +33,8 @@ time CUDA_VISIBLE_DEVICES=1 python -m torch.distributed.launch  \
 --freeze_all_except_lm=False  \
 --speed_perturb=True  \
 --prediction_loss_only=False  \
---verbose_log=False
+--verbose_log=False \
+--greater_is_better=False \
+--metric_for_best_model=eval_wer \
+--ignore_data_skip \
+--use_czc_lr_scheduler=True
